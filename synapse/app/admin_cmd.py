@@ -113,6 +113,174 @@ class AdminCmdServer(HomeServer):
     DATASTORE_CLASS = AdminCmdStore  # type: ignore
 
 
+from typing import Dict
+from synapse.storage.database import LoggingTransaction
+from synapse.storage.databases.main.events_worker import ExtendedRuntimeError
+
+
+def _update_event_ids_txn(txn: LoggingTransaction, old_event_id: str, new_event_id: str):
+    txn.execute("UPDATE event_id_mapping SET new_event_id = ? WHERE event_id = ?",
+                (new_event_id, old_event_id))
+    mapping = txn.rowcount
+    txn.execute("UPDATE events SET event_id = ? WHERE event_id = ?",
+                (new_event_id, old_event_id))
+    events = txn.rowcount
+    txn.execute("UPDATE event_json SET event_id = ? WHERE event_id = ?",
+                (new_event_id, old_event_id))
+    event_json = txn.rowcount
+    #print(f"Changed mapping:{mapping} event_json:{event_json} events:{events}")
+
+async def _process_event_update(store, old_event_id, new_event_id):
+    try:
+        await store.db_pool.runInteraction(
+            "update_event_ids",
+            _update_event_ids_txn,
+            old_event_id, new_event_id,
+            db_autocommit=True
+        )
+        return True
+    except Exception as ex:
+        #print(f"Failed to update event {old_event_id}: {ex}")
+        return False
+
+
+async def _validate_update_event_json(store, event_id: str, old_to_new: Dict[str, str], new_to_old: Dict[str, str]):
+    try:
+        #print(f"validaite json {event_id}")
+        rows = await store.db_pool.simple_select_one(
+            table="event_json",
+            keyvalues={"event_id": event_id},
+            retcols=("json",)
+        )
+        data = json.loads(rows[0])
+
+        fields_to_update = ['auth_events', 'prev_events']
+        updated = False
+
+        for field in fields_to_update:
+            if field not in data:
+                continue
+
+            for i, eid in enumerate(data[field]):
+                if new_to_old.get(eid) is None:
+                    new_id = old_to_new[eid]
+                    data[field][i] = new_id
+                    updated |= True
+
+        if updated:
+            updated_json = json.dumps(data, indent=None, separators=(",", ":"))
+            await store.db_pool.simple_update_one(
+                desc="update_event_json_hashes",
+                table="event_json",
+                keyvalues={"event_id": event_id},
+                updatevalues={"json": updated_json},
+            )
+            #print(f"saved updated json for {event_id}")
+            return 2
+
+        return 1
+    except Exception as exa:
+        #print(f"Failed to update event_json and mapping for {event_id}: {exa}")
+        return 0
+
+async def _event_need_new_hash(store, event_id: str) -> str|bool:
+    try:
+        await store.get_event(
+            event_id=event_id,
+            get_prev_content=False,
+            allow_rejected=True,
+            allow_none=True,
+            check_room_id=None,
+        )
+        return False
+    except ExtendedRuntimeError as ex:
+        #print(f"old hash {event_id} should be {ex.newHash}")
+        return ex.newHash
+
+async def process_room_events(hs: HomeServer, args: argparse.Namespace) -> None:
+    """Process room events."""
+
+    room_id = args.room_id
+    print(f"Processing room {room_id}...")
+
+    store = hs.get_datastores().main
+
+    #  e.room_id='!fCeEXSqGyxLMdBEUsb:utterance-bus.fastr.cloud'
+    event_ids = await store.db_pool.execute(
+        "get_room_events_new_or_old_and_old_for_new_ordered",
+        """
+            SELECT e.event_id AS eid, m.event_id AS old
+            FROM events e
+            LEFT JOIN event_id_mapping m
+            ON m.new_event_id=e.event_id
+            WHERE e.room_id = ?
+            ORDER BY e.stream_ordering ASC
+            """,
+        room_id
+    )
+    events_in_room = len(event_ids)
+    mapping_rows = await store.db_pool.execute(
+        "get_event_mapping_old_to_new",
+        """
+            SELECT m.event_id AS old, m.new_event_id AS new 
+            FROM events e
+            LEFT JOIN event_id_mapping m
+            ON m.new_event_id=e.event_id
+            WHERE room_id = ?
+            """,
+        room_id
+    )
+    mapping: Dict[str, str] = {row[0]: row[1] for row in mapping_rows}
+    mapping_size = len(mapping)
+    print(f"Mapping size {mapping_size}")
+
+    # ensures only processed room events can be used for reverse mapping
+    new_to_old = {}
+
+    count = 0
+    loaded = 0
+    update = 0
+    update_json = 0
+
+    for row in event_ids:
+        count += 1
+        if count%100 == 0:
+            print(f"Processing {row} {count}/{events_in_room}")
+        eid, old_id = row
+        loop_it = True
+
+        while loop_it:
+            new_id = await _event_need_new_hash(store, eid)
+            if new_id is False:
+                if old_id is not None:
+                    #print(f"Event {eid} hash already recalculated from {old_id}")
+                    new_to_old[eid] = old_id
+                    loaded += 1
+                    break
+                else:
+                    print(f"mapping for {eid} is missing but pass validation")
+                    exit(1)
+
+            # check json hashes and update if required
+            state = await _validate_update_event_json(store, eid, mapping, new_to_old)
+            if state == 0:
+                print(f"Failed to update JSON for {eid}")
+                exit(1)
+            elif state == 2:
+                continue
+
+            # update mapping and event_id
+            loop_it = await _process_event_update(store, eid, new_id)
+            if loop_it:
+                #print(f"Successfully updated event {eid} with new hash {new_id}")
+                old_id = eid
+                eid = new_id
+                mapping[old_id] = new_id
+
+    print(f"Total {count}\n Loaded {loaded}\n Updated {update}\n JSON updates {update_json}")
+    exit(0)
+
+
 async def export_data_command(hs: HomeServer, args: argparse.Namespace) -> None:
     """Export data for a user."""
 
@@ -280,6 +448,15 @@ def start(config_options: List[str]) -> None:
         " to creating a temp directory.",
     )
     export_data_parser.set_defaults(func=export_data_command)
+    root_items_parser = subparser.add_parser(
+            "root-items", help="Migrate root events"
+    )
+    root_items_parser.set_defaults(func=update_root_items)
+    room_events_parser = subparser.add_parser(
+            "room-events", help="Process room events"
+    )
+    room_events_parser.add_argument("room_id", help="Room ID to list events")
+    room_events_parser.set_defaults(func=process_room_events)
 
     try:
         config, args = HomeServerConfig.load_config_with_parser(parser, config_options)

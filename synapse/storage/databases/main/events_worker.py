@@ -109,6 +109,12 @@ EVENT_QUEUE_THREADS = 3  # Max number of threads that will fetch events
 EVENT_QUEUE_ITERATIONS = 3  # No. times we block waiting for requests for events
 EVENT_QUEUE_TIMEOUT_S = 0.1  # Timeout when waiting for requests for events
 
+class ExtendedRuntimeError(RuntimeError):
+    """Extended RuntimeError with an additional newHash property."""
+
+    def __init__(self, message, newHash):
+        super().__init__(message)
+        self.newHash = newHash
 
 event_fetch_ongoing_gauge = Gauge(
     "synapse_event_fetch_ongoing",
@@ -1390,10 +1396,10 @@ class EventsWorkerStore(SQLBaseStore):
             if original_ev.event_id != event_id:
                 # it's difficult to see what to do here. Pretty much all bets are off
                 # if Synapse cannot rely on the consistency of its database.
-                raise RuntimeError(
+                raise ExtendedRuntimeError(
                     f"Database corruption: Event {event_id} in room {d['room_id']} "
                     f"from the database appears to have been modified (calculated "
-                    f"event id {original_ev.event_id})"
+                    f"event id {original_ev.event_id})", original_ev.event_id
                 )
 
             event_map[event_id] = original_ev
