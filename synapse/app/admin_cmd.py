@@ -183,19 +183,6 @@ async def _validate_update_event_json(store, event_id: str, old_to_new: Dict[str
         #print(f"Failed to update event_json and mapping for {event_id}: {exa}")
         return 0
 
-async def _event_need_new_hash(store, event_id: str) -> str|bool:
-    try:
-        await store.get_event(
-            event_id=event_id,
-            get_prev_content=False,
-            allow_rejected=True,
-            allow_none=True,
-            check_room_id=None,
-        )
-        return False
-    except ExtendedRuntimeError as ex:
-        #print(f"old hash {event_id} should be {ex.newHash}")
-        return ex.newHash
 
 async def process_room_events(hs: HomeServer, args: argparse.Namespace) -> None:
     """Process room events."""
@@ -291,6 +278,102 @@ async def export_data_command(hs: HomeServer, args: argparse.Namespace) -> None:
         user_id, FileExfiltrationWriter(user_id, directory=directory)
     )
     print(res)
+
+
+async def validate_room_events(hs: HomeServer, args: argparse.Namespace) -> None:
+    from synapse.api.room_versions import KNOWN_ROOM_VERSIONS
+    from synapse.events import make_event_from_dict
+    from synapse.storage._base import db_to_json
+
+    room_id = args.room_id
+    domain_old = args.domain_old
+    domain_new = args.domain_new
+    domain_old = "utterance-bus.fastr.cloud"
+    domain_new = "message-bus.skilld.cloud"
+    print(f"Processing room {room_id}...")
+
+    # see _fetch_event_rows()
+    store = hs.get_datastores().main
+    events = await store.db_pool.execute(
+        "get_room_events_new_or_old_and_old_for_new_ordered",
+        """
+        SELECT
+          e.event_id,
+          e.stream_ordering,
+          ej.internal_metadata,
+          ej.json,
+          ej.format_version,
+          r.room_version,
+          rej.reason,
+          e.outlier
+        FROM events AS e
+          JOIN event_json AS ej USING (event_id)
+          LEFT JOIN rooms r ON r.room_id = e.room_id
+          LEFT JOIN rejections as rej USING (event_id)
+        WHERE e.room_id = ?
+        ORDER BY e.stream_ordering ASC
+        """,
+        room_id
+    )
+    events_in_room = len(events)
+    print(f"events found {events_in_room}")
+
+    room_is_new = domain_new in room_id
+    counter = 0
+    old_to_new = {}
+    for row in events:
+        counter += 1
+        eid = row[0]
+        print(f"Processing {eid} - {counter}")
+
+        room_version = KNOWN_ROOM_VERSIONS.get(row[5])
+        internal_metadata = {} # db_to_json(row[2])
+        rejected_reason = row[6]
+        json = row[3]
+        if room_is_new:
+            json_new = json.replace(domain_new, domain_old)
+        else:
+            json_new = json.replace(domain_old, domain_new)
+        event = make_event_from_dict(
+            event_dict=db_to_json(json),
+            room_version=room_version,
+            internal_metadata_dict=internal_metadata,
+            rejected_reason=rejected_reason,
+        )
+        event_new = make_event_from_dict(
+            event_dict=db_to_json(json_new),
+            room_version=room_version,
+            internal_metadata_dict=internal_metadata,
+            rejected_reason=rejected_reason,
+        )
+        # validate and update parent events
+        fields_to_update = ['auth_events', 'prev_events']
+        missing_parents = {}
+        for field in fields_to_update:
+            if field not in event:
+                continue
+
+            for i, id in enumerate(event_new[field]):
+                if old_to_new.get(id) is None:
+                    missing_parents.setdefault(field, set()).add(id)
+                    continue
+                event_new[field][i] = old_to_new[id]
+        if missing_parents:
+            print(f"missing parents {missing_parents} for {eid}")
+            exit(1)
+
+        new_id = event_new.event_id
+        print(f"current room {event.room_id} sender {event.sender}")
+        print(f"auth {event.auth_event_ids()}")
+        print(f"prev {event.prev_event_ids()}")
+        print(f"new event {new_id} in room {event_new.room_id} sender {event_new.sender}")
+        print(f"auth {event_new.auth_event_ids()}")
+        print(f"prev {event_new.prev_event_ids()}")
+        if new_id != eid:
+            print(f"new event {new_id} should replace {eid}")
+        else:
+            print(f"skip, event hash valid")
+        old_to_new[eid] = new_id
 
 
 class FileExfiltrationWriter(ExfiltrationWriter):
@@ -457,6 +540,13 @@ def start(config_options: List[str]) -> None:
     )
     room_events_parser.add_argument("room_id", help="Room ID to list events")
     room_events_parser.set_defaults(func=process_room_events)
+    room_val_parser = subparser.add_parser(
+            "room-val", help="Validate room events"
+    )
+    room_val_parser.add_argument("room_id", help="Room ID to list events")
+    room_val_parser.add_argument("from", help="Domain TLD to replace for events")
+    room_val_parser.add_argument("to", help="Domain TLD for new events")
+    room_val_parser.set_defaults(func=validate_room_events)
 
     try:
         config, args = HomeServerConfig.load_config_with_parser(parser, config_options)
